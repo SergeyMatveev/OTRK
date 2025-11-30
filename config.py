@@ -27,13 +27,23 @@ def ensure_directories() -> None:
 def make_request_dir(user_id: int, original_filename: str, request_ts: str) -> Path:
     """
     Создаёт директорию для конкретного запроса пользователя:
-    data/<telegram_id>/<base_filename>_<request_ts>/
+    data/<telegram_id>/<request_ts>_<base_filename>/
     """
     base_name = Path(original_filename).stem
     user_dir = DATA_DIR / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
 
-    request_dir_name = f"{base_name}_{request_ts}"
+    request_dir_name = f"{request_ts}_{base_name}"
     request_dir = user_dir / request_dir_name
     request_dir.mkdir(parents=True, exist_ok=True)
     return request_dir
+
+
+def make_llm_io_path(request_dir: Path, original_filename: str, request_ts: str) -> Path:
+    """
+    Возвращает путь к файлу llm_io_<name_of_the_sent_pdf_file>_<date_time>.txt
+    внутри директории запроса.
+    """
+    base_name = Path(original_filename).name
+    llm_io_name = f"llm_io_{base_name}_{request_ts}.txt"
+    return request_dir / llm_io_name

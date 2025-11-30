@@ -1,0 +1,464 @@
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import List, Dict
+from logging import Logger
+from decimal import Decimal, InvalidOperation
+import re
+
+import pandas as pd
+
+
+_PKO_RAW = "ПРОФЕССИОНАЛЬНАЯКОЛЛЕКТОРСКАЯОРГАНИЗАЦИЯ"
+_PKO_PATTERN = re.compile("(?iu)" + r"\s*".join(list(_PKO_RAW)))
+
+
+def _is_nd(value: object) -> bool:
+    if value is None:
+        return True
+    s = str(value).strip()
+    return s == "" or s.upper() == "Н/Д"
+
+
+def _normalize_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _normalize_org_forms(name: str) -> str:
+    """
+    Нормализует ОПФ в наименовании:
+      - длинные формы "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ" -> "ООО "
+      - "ПРОФЕССИОНАЛЬНАЯ КОЛЛЕКТОРСКАЯ ОРГАНИЗАЦИЯ" (с разрывами) -> "ПКО "
+    """
+    if not name:
+        return "Н/Д"
+
+    s = _normalize_whitespace(name)
+
+    # ООО
+    s = re.sub(
+        r"(?iu)\bОБЩЕСТВ[О0]\s+С\s+ОГРАНИЧЕННОЙ\s+ОТВЕТСТВЕННОСТ[ЬЪB6]Ю?\b\s*",
+        "ООО ",
+        s,
+    )
+
+    # ПКО (допускаем разрывы внутри слов)
+    s = _PKO_PATTERN.sub("ПКО ", s)
+
+    # Убираем лишние пробелы перед кавычками
+    s = re.sub(r"\s+([\"»])", r"\1", s)
+    s = re.sub(r"\s+(«)", r"\1", s)
+    s = _normalize_whitespace(s)
+
+    return s or "Н/Д"
+
+
+def _normalize_creditor_name(name: object, *, normalize_opf: bool) -> str:
+    if name is None:
+        return "Н/Д"
+    s = str(name).strip()
+    if not s or _is_nd(s):
+        return "Н/Д"
+    s = _normalize_whitespace(s)
+    if normalize_opf:
+        s = _normalize_org_forms(s)
+    return s or "Н/Д"
+
+
+def _normalize_inn(value: object) -> str:
+    if value is None:
+        return "Н/Д"
+    s = str(value).strip()
+    if not s or _is_nd(s):
+        return "Н/Д"
+    m = re.search(r"(?<!\d)(\d{10})(?!\d)", s)
+    if m:
+        return m.group(1)
+    return "Н/Д"
+
+
+def _normalize_amount(value: object) -> str:
+    """
+    Приводит строку с числом к формату ХХХХХ,YY.
+    Если число не найдено или некорректно — возвращает "Н/Д".
+    """
+    if value is None:
+        return "Н/Д"
+    s = str(value).strip()
+    if not s or s.upper() == "Н/Д":
+        return "Н/Д"
+
+    m = re.search(r"\d[\d ]*(?:[.,]\d{1,2})?", s)
+    if not m:
+        return "Н/Д"
+    num = m.group(0)
+    num = num.replace(" ", "")
+    num = num.replace(",", ".")
+
+    try:
+        dec = Decimal(num)
+    except InvalidOperation:
+        return "Н/Д"
+
+    dec = dec.quantize(Decimal("0.01"))
+    s_val = format(dec, "f").replace(".", ",")
+    return s_val
+
+
+def _format_sum_with_currency(value: object) -> str:
+    """
+    Для строки "Сумма и валюта:":
+      - если есть число -> "<сумма_2_знака> RUB"
+      - если "Н/Д" -> "Н/Д"
+    """
+    norm = _normalize_amount(value)
+    if norm == "Н/Д":
+        return "Н/Д"
+    return f"{norm} RUB"
+
+
+def _format_debt(value: object) -> str:
+    """
+    Для строки "Текущая задолженность:":
+      - если есть число -> "<сумма_2_знака>"
+      - если "Н/Д" -> "Н/Д"
+    """
+    return _normalize_amount(value)
+
+
+def build_credit_report_from_csv(
+    csv_path: Path,
+    logger: Logger,
+    *,
+    telegram_user_id: str,
+    telegram_username: str,
+    request_id: str,
+    file_name: str,
+) -> List[str]:
+    """
+    Загружает итоговый CSV, добавляет колонку "Решение",
+    формирует текстовый отчёт по открытым кредитам и возвращает список сообщений.
+    """
+    csv_path = csv_path.resolve()
+    overall_start = time.perf_counter()
+
+    base_extra: Dict[str, object] = {
+        "telegram_user_id": telegram_user_id,
+        "telegram_username": telegram_username,
+        "request_id": request_id,
+        "model": "N/A",
+        "api_key_id": "N/A",
+        "file_name": file_name,
+    }
+
+    logger.info(
+        "Построение текстового отчёта по CSV %s начато.",
+        csv_path,
+        extra={**base_extra, "stage": "report_builder_start", "duration_seconds": 0},
+    )
+
+    try:
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8-sig")
+        except Exception:
+            df = pd.read_csv(csv_path, encoding="utf-8")
+    except Exception:
+        duration = time.perf_counter() - overall_start
+        logger.error(
+            "Не удалось загрузить CSV %s для построения отчёта.",
+            csv_path,
+            exc_info=True,
+            extra={
+                **base_extra,
+                "stage": "report_builder_read_error",
+                "duration_seconds": round(duration, 3),
+            },
+        )
+        raise
+
+    if "Решение" not in df.columns:
+        df["Решение"] = ""
+    else:
+        df["Решение"] = df["Решение"].fillna("")
+
+    decisions: Dict[object, str] = {}
+    use_acquirer: Dict[object, bool] = {}
+    for idx in df.index:
+        decisions[idx] = ""
+        use_acquirer[idx] = False
+
+    # Шаг 1: базовый фильтр по "Прекращение обязательства"
+    uid_groups: Dict[str, List[object]] = {}
+
+    for idx in df.index:
+        row = df.loc[idx]
+        prekr = str(row.get("Прекращение обязательства", "") or "").strip()
+        uid_val = str(row.get("УИд договора", "") or "").strip()
+
+        if prekr != "Н/Д":
+            if prekr == "Надлежащее исполнение обязательства":
+                decisions[idx] = "Исключен. Надлежащее исполнение обязательства"
+            else:
+                decisions[idx] = "Исключен. Не попал в правила отбора"
+
+        if prekr == "Н/Д":
+            if uid_val == "" or uid_val == "Не найдено":
+                decisions[idx] = "Исключен. Не найден УИд договора"
+            else:
+                uid_groups.setdefault(uid_val, []).append(idx)
+
+    # Шаг 2: группировка по УИд договора
+    for uid, idxs in uid_groups.items():
+        if not idxs:
+            continue
+
+        if len(idxs) == 1:
+            # Один договор с данным УИд
+            idx = idxs[0]
+            row = df.loc[idx]
+            acq_name = row.get("Приобретатель прав кредитора", "")
+            acq_inn = row.get("ИНН приобретателя прав кредитора", "")
+
+            acq_name_is_nd = _is_nd(acq_name)
+            acq_inn_norm = _normalize_inn(acq_inn)
+            if not acq_name_is_nd and acq_inn_norm != "Н/Д":
+                decisions[idx] = "Добавлен. Кредит выкуплен"
+                use_acquirer[idx] = True
+            else:
+                decisions[idx] = "Добавлен"
+                use_acquirer[idx] = False
+        else:
+            # Несколько строк с одинаковым УИд
+            acq_names = {
+                idx: df.loc[idx].get("Приобретатель прав кредитора", "") for idx in idxs
+            }
+            idxs_nd = [idx for idx in idxs if _is_nd(acq_names[idx])]
+
+            if idxs_nd:
+                # Вариант A: есть строка без приобретателя (Н/Д) — считаем исходным кредитором
+                base_idx = idxs_nd[0]
+                decisions[base_idx] = "Добавлен"
+                use_acquirer[base_idx] = False
+
+                for idx in idxs:
+                    if idx == base_idx:
+                        continue
+                    if not decisions[idx]:
+                        decisions[idx] = "Исключен. Одинаковый УИд, кредит выкуплен"
+                    use_acquirer[idx] = False
+            else:
+                # Вариант Б: все строки с заполненным приобретателем — все добавляем
+                for idx in idxs:
+                    decisions[idx] = "Добавлен. Несколько строк с одинаковым УИд"
+                    use_acquirer[idx] = True
+
+    # Финальное заполнение "Решение" для всех строк
+    for idx in df.index:
+        if not decisions[idx]:
+            prekr = str(df.loc[idx].get("Прекращение обязательства", "") or "").strip()
+            if prekr == "Н/Д":
+                decisions[idx] = "Исключен. Не попал в правила отбора"
+            elif prekr == "Надлежащее исполнение обязательства":
+                decisions[idx] = "Исключен. Надлежащее исполнение обязательства"
+            else:
+                decisions[idx] = "Исключен. Не попал в правила отбора"
+
+    df["Решение"] = [decisions[idx] for idx in df.index]
+
+    # Перезаписываем CSV тем же путём
+    try:
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    except Exception:
+        duration = time.perf_counter() - overall_start
+        logger.error(
+            "Не удалось сохранить обновлённый CSV с колонкой 'Решение': %s",
+            csv_path,
+            exc_info=True,
+            extra={
+                **base_extra,
+                "stage": "report_builder_write_error",
+                "duration_seconds": round(duration, 3),
+            },
+        )
+        raise
+
+    added_mask = df["Решение"].astype(str).str.startswith("Добавлен")
+    added_count = int(added_mask.sum())
+    total_rows = int(len(df))
+
+    logger.info(
+        "Колонка 'Решение' заполнена: всего строк=%d, добавлено=%d, исключено=%d.",
+        total_rows,
+        added_count,
+        total_rows - added_count,
+        extra={
+            **base_extra,
+            "stage": "report_builder_decisions_done",
+            "duration_seconds": 0,
+        },
+    )
+
+    if added_count == 0:
+        duration = time.perf_counter() - overall_start
+        logger.info(
+            "Открытых кредитов по заданным правилам не найдено, текстовый отчёт пуст.",
+            extra={
+                **base_extra,
+                "stage": "report_builder_done",
+                "duration_seconds": round(duration, 3),
+            },
+        )
+        return []
+
+    # Группировка "добавленных" строк по финальному ИНН
+    groups: Dict[str, Dict[str, object]] = {}
+    order_final_inn: List[str] = []
+
+    for idx in df.index:
+        if not added_mask.loc[idx]:
+            continue
+
+        row = df.loc[idx]
+        if use_acquirer.get(idx, False):
+            raw_name = row.get("Приобретатель прав кредитора", "")
+            raw_inn = row.get("ИНН приобретателя прав кредитора", "")
+            final_name = _normalize_creditor_name(raw_name, normalize_opf=True)
+            final_inn = _normalize_inn(raw_inn)
+        else:
+            raw_name = row.get("Короткое название", "")
+            raw_inn = row.get("ИНН", "")
+            final_name = _normalize_creditor_name(raw_name, normalize_opf=False)
+            final_inn = _normalize_inn(raw_inn)
+
+        if final_name == "Н/Д" and not _is_nd(raw_name):
+            # Подчистим хотя бы пробелы
+            final_name = _normalize_whitespace(raw_name)
+
+        if not final_name:
+            final_name = "Н/Д"
+        if not final_inn:
+            final_inn = "Н/Д"
+
+        group_key = final_inn
+
+        if group_key not in groups:
+            groups[group_key] = {
+                "final_name": final_name,
+                "final_inn": final_inn,
+                "rows": [],
+            }
+            order_final_inn.append(group_key)
+
+        groups[group_key]["rows"].append(
+            {
+                "idx": idx,
+                "number": row.get("Номер", ""),
+                "uid": str(row.get("УИд договора", "") or ""),
+                "date": str(row.get("Дата сделки", "") or "Н/Д"),
+                "sum_text": row.get("Сумма и валюта", "Н/Д"),
+                "debt_text": row.get("Сумма задолженности", "Н/Д"),
+            }
+        )
+
+    # Формируем текстовые блоки
+    from string import ascii_uppercase
+
+    blocks: List[str] = []
+    block_index = 0
+
+    for inn_key in order_final_inn:
+        group = groups[inn_key]
+        rows = group["rows"]
+
+        # Сортировка внутри группы по "Номер" (как в исходном CSV)
+        def _num_key(item: Dict[str, object]) -> int:
+            num_raw = str(item.get("number", "") or "").strip()
+            try:
+                return int(num_raw.split()[0])
+            except (ValueError, IndexError):
+                return 10**9
+
+        rows.sort(key=_num_key)
+
+        block_index += 1
+        final_name = group["final_name"]
+        final_inn = group["final_inn"]
+
+        block_lines: List[str] = []
+        block_lines.append(f"{block_index}. Кредитор:")
+        block_lines.append(f"    Наименование: {final_name}")
+        block_lines.append(f"    ИНН: {final_inn}")
+
+        if len(rows) == 1:
+            r = rows[0]
+            date = r["date"] or "Н/Д"
+            sum_str = _format_sum_with_currency(r["sum_text"])
+            debt_str = _format_debt(r["debt_text"])
+            uid_val = r["uid"] or "Н/Д"
+
+            block_lines.append("    Договор:")
+            block_lines.append(f"        Дата сделки: {date}")
+            block_lines.append(f"        Сумма и валюта: {sum_str}")
+            block_lines.append(f"        Текущая задолженность: {debt_str}")
+            block_lines.append(f"        УИд договора: {uid_val}")
+        else:
+            for i, r in enumerate(rows):
+                label = ascii_uppercase[i] if i < len(ascii_uppercase) else str(i + 1)
+                date = r["date"] or "Н/Д"
+                sum_str = _format_sum_with_currency(r["sum_text"])
+                debt_str = _format_debt(r["debt_text"])
+                uid_val = r["uid"] or "Н/Д"
+
+                block_lines.append(f"    Договор {label}:")
+                block_lines.append(f"        Дата сделки: {date}")
+                block_lines.append(f"        Сумма и валюта: {sum_str}")
+                block_lines.append(f"        Текущая задолженность: {debt_str}")
+                block_lines.append(f"        УИд договора: {uid_val}")
+
+            # Проверка на несколько строк с одинаковым УИд внутри блока
+            uid_counts: Dict[str, int] = {}
+            for r in rows:
+                u = (r["uid"] or "").strip()
+                if u and u != "Не найдено":
+                    uid_counts[u] = uid_counts.get(u, 0) + 1
+            if any(c > 1 for c in uid_counts.values()):
+                block_lines.append("    (Внимание, несколько строк с одинаковым УИд)")
+
+        block_text = "\n".join(block_lines).rstrip()
+        blocks.append(block_text)
+
+    # Разбиение блоков на сообщения по лимиту 4000 символов
+    messages: List[str] = []
+    current_blocks: List[str] = []
+
+    for block in blocks:
+        if not current_blocks:
+            current_blocks = [block]
+            continue
+
+        candidate = "\n\n".join(current_blocks + [block])
+        if len(candidate) <= 4000:
+            current_blocks.append(block)
+        else:
+            messages.append("\n\n".join(current_blocks))
+            current_blocks = [block]
+
+    if current_blocks:
+        messages.append("\n\n".join(current_blocks))
+
+    duration = time.perf_counter() - overall_start
+    logger.info(
+        "Построение текстового отчёта завершено: блоков=%d, сообщений=%d.",
+        len(blocks),
+        len(messages),
+        extra={
+            **base_extra,
+            "stage": "report_builder_done",
+            "duration_seconds": round(duration, 3),
+        },
+    )
+
+    return messages
+
+
