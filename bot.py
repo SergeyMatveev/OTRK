@@ -19,6 +19,7 @@ from config import BOT_TOKEN, make_request_dir
 from pipeline import process_nbki_pdf
 from logging_setup import FileStats, append_stats_row
 from report_builder import build_credit_report_from_csv
+from commands import download_logs_handler
 
 
 INTRO_TEXT = "Я готов обработать отчёт НБКИ, пришлите PDF."
@@ -375,9 +376,11 @@ def create_application(logger: Logger) -> Application:
 
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("help", help_handler))
+    application.add_handler(CommandHandler("download_logs", download_logs_handler))
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     return application
+
 
 

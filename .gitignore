@@ -5,3 +5,4 @@ __pycache__/
 extract_code.sh
 code_extracts/
 apply_newcode.py
+old_shit/
